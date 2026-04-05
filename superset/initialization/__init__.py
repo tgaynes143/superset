@@ -174,6 +174,9 @@ class SupersetAppInitializer:  # pylint: disable=too-many-public-methods
         from superset.explore.permalink.api import ExplorePermalinkRestApi
         from superset.extensions.view import ExtensionsView
         from superset.importexport.api import ImportExportRestApi
+        from superset.insurance_commission_audit.advanced_api import (
+            CommissionAuditIntelligenceApi,
+        )
         from superset.insurance_commission_audit.api import (
             AuditFindingRestApi,
             CommissionAuditReportRestApi,
@@ -273,6 +276,7 @@ class SupersetAppInitializer:  # pylint: disable=too-many-public-methods
         appbuilder.add_api(CommissionTransactionRestApi)
         appbuilder.add_api(CommissionAuditReportRestApi)
         appbuilder.add_api(AuditFindingRestApi)
+        appbuilder.add_api(CommissionAuditIntelligenceApi)
         appbuilder.add_api(QueryRestApi)
         appbuilder.add_api(ReportScheduleRestApi)
         appbuilder.add_api(ReportExecutionLogRestApi)
