@@ -644,3 +644,222 @@ class CommissionAuditIntelligenceApi(BaseApi):
             200,
             result={"state": state, "rate_limits": result},
         )
+
+    @expose("/forensic_audit", methods=("POST",))
+    @protect()
+    @safe
+    @statsd_metrics
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: f"{self.__class__.__name__}"
+        ".forensic_audit",
+        log_to_statsd=False,
+    )
+    def forensic_audit(self) -> Response:
+        """Run a forensic audit on carrier commission payments.
+        ---
+        post:
+          summary: Run forensic commission audit
+          description: >
+            Independently verifies carrier commission payments against
+            policies and contracted rate schedules. Detects underpayments,
+            missing payments, rate mismatches, and suspicious chargebacks.
+            Generates evidence packages for recovery.
+          requestBody:
+            required: true
+            content:
+              application/json:
+                schema:
+                  type: object
+                  required:
+                    - policies
+                    - rate_schedules
+                    - carrier_payments
+                  properties:
+                    policies:
+                      type: array
+                    rate_schedules:
+                      type: array
+                    carrier_payments:
+                      type: array
+                    audit_period_start:
+                      type: string
+                    audit_period_end:
+                      type: string
+          responses:
+            200:
+              description: Forensic audit completed
+            400:
+              $ref: '#/components/responses/400'
+            500:
+              $ref: '#/components/responses/500'
+        """
+        try:
+            from datetime import date as date_type
+            from dataclasses import asdict
+
+            from superset.insurance_commission_audit.forensic_auditor import (
+                CarrierPayment,
+                ForensicAuditor,
+                PolicyRecord,
+                RateScheduleEntry,
+            )
+
+            payload = request.json or {}
+            raw_policies = payload.get("policies", [])
+            raw_rates = payload.get("rate_schedules", [])
+            raw_payments = payload.get("carrier_payments", [])
+
+            if not raw_policies:
+                return self.response_400(
+                    message="At least one policy is required."
+                )
+            if not raw_payments:
+                return self.response_400(
+                    message="At least one carrier payment is required."
+                )
+
+            def parse_date(val: str | None) -> date_type | None:
+                if not val:
+                    return None
+                return date_type.fromisoformat(val)
+
+            policies = [
+                PolicyRecord(
+                    policy_number=p["policy_number"],
+                    carrier_name=p.get("carrier_name", ""),
+                    carrier_code=p.get("carrier_code", ""),
+                    line_of_business=p.get("line_of_business", ""),
+                    product_name=p.get("product_name", ""),
+                    insured_name=p.get("insured_name", ""),
+                    effective_date=date_type.fromisoformat(
+                        p["effective_date"]
+                    ),
+                    expiry_date=parse_date(p.get("expiry_date")),
+                    annual_premium=p.get("annual_premium", 0),
+                    policy_status=p.get("policy_status", "active"),
+                    writing_producer_npn=p.get("writing_producer_npn", ""),
+                    cancel_date=parse_date(p.get("cancel_date")),
+                    cancel_reason=p.get("cancel_reason", ""),
+                )
+                for p in raw_policies
+            ]
+
+            rate_schedules = [
+                RateScheduleEntry(
+                    carrier_code=r.get("carrier_code", ""),
+                    carrier_name=r.get("carrier_name", ""),
+                    line_of_business=r.get("line_of_business", ""),
+                    product_name=r.get("product_name", ""),
+                    commission_type=r.get("commission_type", "new_business"),
+                    contracted_rate=r.get("contracted_rate", 0),
+                    effective_date=parse_date(r.get("effective_date")),
+                    tier_minimum_premium=r.get("tier_minimum_premium", 0),
+                )
+                for r in raw_rates
+            ]
+
+            payments = [
+                CarrierPayment(
+                    payment_id=pm.get("payment_id", ""),
+                    carrier_code=pm.get("carrier_code", ""),
+                    carrier_name=pm.get("carrier_name", ""),
+                    statement_date=date_type.fromisoformat(
+                        pm["statement_date"]
+                    ),
+                    policy_number=pm["policy_number"],
+                    transaction_type=pm.get("transaction_type", "commission"),
+                    line_of_business=pm.get("line_of_business", ""),
+                    premium_basis=pm.get("premium_basis", 0),
+                    commission_rate_applied=pm.get(
+                        "commission_rate_applied", 0
+                    ),
+                    amount_paid=pm.get("amount_paid", 0),
+                    producer_npn=pm.get("producer_npn", ""),
+                    notes=pm.get("notes", ""),
+                )
+                for pm in raw_payments
+            ]
+
+            auditor = ForensicAuditor(
+                policies=policies,
+                rate_schedules=rate_schedules,
+                carrier_payments=payments,
+                audit_period_start=parse_date(
+                    payload.get("audit_period_start")
+                ),
+                audit_period_end=parse_date(
+                    payload.get("audit_period_end")
+                ),
+            )
+            result = auditor.run_audit()
+
+            return self.response(
+                200,
+                result={
+                    "summary": {
+                        "policies_audited": result.total_policies_audited,
+                        "expected_commission": result.total_expected_commission,
+                        "actual_paid": result.total_actual_paid,
+                        "total_variance": result.total_variance,
+                        "net_underpayment": result.net_underpayment,
+                        "net_overpayment": result.net_overpayment,
+                        "missing_payments": result.total_missing_payments,
+                        "recovery_opportunity": result.total_recovery_opportunity,
+                    },
+                    "reconciliation": [
+                        {
+                            "policy_number": r.policy_number,
+                            "carrier": r.carrier_name,
+                            "expected": r.expected_amount,
+                            "actual": r.actual_amount,
+                            "variance": r.variance,
+                            "status": r.status,
+                            "severity": r.severity,
+                            "notes": r.evidence_notes,
+                        }
+                        for r in result.reconciliation
+                    ],
+                    "carrier_scorecards": [
+                        {
+                            "carrier": s.carrier_name,
+                            "grade": s.grade,
+                            "overall_score": s.overall_score,
+                            "accuracy": s.accuracy_score,
+                            "completeness": s.completeness_score,
+                            "total_variance": s.total_variance,
+                            "underpayments": s.underpayment_count,
+                            "missing": s.missing_payment_count,
+                            "issues": s.issues,
+                            "recommendations": s.recommendations,
+                        }
+                        for s in result.carrier_scorecards
+                    ],
+                    "evidence_package": [
+                        {
+                            "id": e.evidence_id,
+                            "category": e.category,
+                            "severity": e.severity,
+                            "carrier": e.carrier_name,
+                            "policy": e.policy_number,
+                            "description": e.description,
+                            "recovery_amount": e.recovery_amount,
+                            "action": e.recommended_action,
+                            "facts": e.supporting_facts,
+                        }
+                        for e in result.evidence_package
+                    ],
+                    "payment_lag_analysis": result.payment_lag_analysis,
+                    "earnings_gap": result.earnings_gap_analysis,
+                    "chargeback_analysis": result.chargeback_analysis,
+                    "immediate_actions": result.immediate_actions,
+                    "recovery_actions": result.recovery_actions,
+                    "process_improvements": result.process_improvements,
+                },
+            )
+        except KeyError as ex:
+            return self.response_400(message=f"Missing required field: {ex}")
+        except Exception as ex:
+            logger.error(
+                "Error in forensic audit: %s", str(ex), exc_info=True
+            )
+            return self.response(500, message=str(ex))
